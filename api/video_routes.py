@@ -4,16 +4,18 @@ Video streaming API routes for workout tracking application.
 This module defines the API endpoints for video streaming functionality,
 providing real-time video feed with pose detection and exercise analysis.
 """
-from flask import Blueprint, Response, request, jsonify, session
 import cv2
 import numpy as np
 import threading
 import time
 import base64
 from typing import Dict, Any, Optional
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 
-# Create Blueprint for video routes
-video_bp = Blueprint('video', __name__, url_prefix='/api/video')
+# Create router
+video_router = APIRouter()
 
 # Global video processor instance (to be set by the main application)
 video_processor = None
@@ -29,6 +31,26 @@ frame_buffer_updated = threading.Event()
 processing_active = False
 processing_thread = None
 
+# Pydantic models for request/response validation
+class VideoStartRequest(BaseModel):
+    camera_index: int = 0
+
+class VideoStopResponse(BaseModel):
+    success: bool
+    message: str
+
+class VideoStatusResponse(BaseModel):
+    camera_initialized: bool
+    processing_active: bool
+    frame_available: bool
+
+class VideoFrameResponse(BaseModel):
+    success: bool
+    frame: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    timestamp: Optional[float] = None
+    error: Optional[str] = None
 
 def initialize_camera(camera_index=0):
     """
@@ -163,8 +185,8 @@ def generate_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 
-@video_bp.route('/feed')
-def video_feed():
+@video_router.get("/feed")
+async def video_feed():
     """
     Stream the processed video feed.
     
@@ -179,14 +201,14 @@ def video_feed():
         start_frame_processing()
     
     # Return streaming response
-    return Response(
+    return StreamingResponse(
         generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
+        media_type='multipart/x-mixed-replace; boundary=frame'
     )
 
 
-@video_bp.route('/frame', methods=['GET'])
-def get_current_frame():
+@video_router.get("/frame", response_model=VideoFrameResponse)
+async def get_current_frame():
     """
     Get the current processed frame as a base64-encoded JPEG.
     
@@ -197,10 +219,10 @@ def get_current_frame():
     
     with frame_buffer_lock:
         if frame_buffer is None:
-            return jsonify({
-                'success': False,
-                'error': 'No frame available'
-            }), 404
+            return VideoFrameResponse(
+                success=False,
+                error='No frame available'
+            )
         
         current_frame = frame_buffer.copy()
     
@@ -208,17 +230,17 @@ def get_current_frame():
     _, buffer = cv2.imencode('.jpg', current_frame)
     b64_frame = base64.b64encode(buffer).decode('utf-8')
     
-    return jsonify({
-        'success': True,
-        'frame': b64_frame,
-        'width': current_frame.shape[1],
-        'height': current_frame.shape[0],
-        'timestamp': time.time()
-    })
+    return VideoFrameResponse(
+        success=True,
+        frame=b64_frame,
+        width=current_frame.shape[1],
+        height=current_frame.shape[0],
+        timestamp=time.time()
+    )
 
 
-@video_bp.route('/start', methods=['POST'])
-def start_video():
+@video_router.post("/start")
+async def start_video(data: VideoStartRequest):
     """
     Start video processing.
     
@@ -230,25 +252,25 @@ def start_video():
     Returns:
         JSON response indicating success or failure.
     """
-    camera_index = request.json.get('camera_index', 0) if request.is_json else 0
+    camera_index = data.camera_index
     
     success = initialize_camera(camera_index)
     if not success:
-        return jsonify({
-            'success': False,
-            'error': f'Failed to initialize camera at index {camera_index}'
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f'Failed to initialize camera at index {camera_index}'
+        )
     
     start_frame_processing()
     
-    return jsonify({
+    return {
         'success': True,
         'message': 'Video processing started'
-    })
+    }
 
 
-@video_bp.route('/stop', methods=['POST'])
-def stop_video():
+@video_router.post("/stop", response_model=VideoStopResponse)
+async def stop_video():
     """
     Stop video processing and release camera.
     
@@ -258,14 +280,14 @@ def stop_video():
     stop_frame_processing()
     release_camera()
     
-    return jsonify({
-        'success': True,
-        'message': 'Video processing stopped'
-    })
+    return VideoStopResponse(
+        success=True,
+        message='Video processing stopped'
+    )
 
 
-@video_bp.route('/status', methods=['GET'])
-def get_video_status():
+@video_router.get("/status", response_model=VideoStatusResponse)
+async def get_video_status():
     """
     Get current status of video processing.
     
@@ -278,8 +300,8 @@ def get_video_status():
     with camera_lock:
         camera_initialized = camera is not None and camera.isOpened()
     
-    return jsonify({
-        'camera_initialized': camera_initialized,
-        'processing_active': processing_active,
-        'frame_available': frame_buffer is not None
-    })
+    return VideoStatusResponse(
+        camera_initialized=camera_initialized,
+        processing_active=processing_active,
+        frame_available=frame_buffer is not None
+    )

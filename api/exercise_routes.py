@@ -4,76 +4,92 @@ Exercise API routes for workout tracking application.
 This module defines the REST API endpoints for managing exercise tracking,
 including starting exercises, retrieving exercise data, and managing workout sessions.
 """
-from flask import Blueprint, request, jsonify, session
-from typing import Dict, Any
 import time
-from modules.video_processor import VideoProcessor, ExerciseType
-from database.repository import WorkoutSessionRepository, ExerciseRecord
-from database.models import db
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
 
-# Create Blueprint for exercise routes
-exercise_bp = Blueprint('exercise', __name__, url_prefix='/api/exercise')
+from modules.video_processor import VideoProcessor, ExerciseType
+from database.repository import WorkoutSessionRepository
+from database.db import get_db
+
+# Create router
+exercise_router = APIRouter()
 
 # Global video processor instance (shared across routes)
-video_processor = None
+video_processor = VideoProcessor()
 
+# Pydantic models for request/response validation
+class StartExerciseRequest(BaseModel):
+    exercise: str
+    is_timed: bool = False
+    target_reps: Optional[int] = None
+    target_duration: Optional[int] = None
 
-@exercise_bp.before_app_first_request
-def initialize_video_processor():
-    """Initialize the video processor on first request."""
-    global video_processor
-    if video_processor is None:
-        video_processor = VideoProcessor()
+class ExerciseDataResponse(BaseModel):
+    current_exercise: Optional[str] = None
+    exercise_state: Optional[str] = None
+    rep_count: int = 0
+    time_accumulated: float = 0
+    feedback: List[str] = []
+    is_timed_exercise: bool = False
+    progress: float = 0
+    target_reps: Optional[int] = None
+    target_duration: Optional[int] = None
+    detailed_metrics: Dict[str, Any] = {}
 
+class ExerciseFeedback(BaseModel):
+    text: str
+    count: int
+    severity: Optional[str] = None
 
-@exercise_bp.route('/start', methods=['POST'])
-def start_exercise():
+class CommonFeedbackResponse(BaseModel):
+    success: bool
+    feedback: List[Dict[str, Any]] = []
+
+class ExerciseHistoryResponse(BaseModel):
+    success: bool
+    history: List[Dict[str, Any]] = []
+
+class ExerciseStatsResponse(BaseModel):
+    success: bool
+    statistics: Dict[str, Any] = {}
+
+class ExerciseStopResponse(BaseModel):
+    success: bool
+    exercise: str
+    duration: float
+    rep_count: int
+    time_accumulated: float
+    statistics: Dict[str, Any]
+
+@exercise_router.post("/start", response_model=Dict[str, Any])
+async def start_exercise(
+    data: StartExerciseRequest, 
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Start a specific exercise for tracking.
-    
-    Request JSON:
-        {
-            "exercise": "exercise_name",
-            "is_timed": false,  // Optional, default is false
-            "target_reps": 10,  // Optional
-            "target_duration": 60  // Optional, for timed exercises (seconds)
-        }
-        
-    Returns:
-        JSON response indicating success or failure.
     """
-    global video_processor
-    data = request.json
-    
-    # Validate request data
-    if not data or 'exercise' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Missing required fields'
-        }), 400
-    
-    exercise_name = data['exercise']
-    is_timed = data.get('is_timed', False)
-    
-    # Optional parameters
-    target_reps = data.get('target_reps')
-    target_duration = data.get('target_duration')
+    session = request.session
     
     # Set current exercise in video processor
-    success = video_processor.set_current_exercise(exercise_name, is_timed)
+    success = video_processor.set_current_exercise(data.exercise, data.is_timed)
     
     if not success:
-        return jsonify({
-            'success': False,
-            'error': f'Invalid exercise type: {exercise_name}'
-        }), 400
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid exercise type: {data.exercise}"
+        )
     
     # Store exercise parameters in session
     session['current_exercise'] = {
-        'name': exercise_name,
-        'is_timed': is_timed,
-        'target_reps': target_reps,
-        'target_duration': target_duration,
+        'name': data.exercise,
+        'is_timed': data.is_timed,
+        'target_reps': data.target_reps,
+        'target_duration': data.target_duration,
         'start_time': time.time()
     }
     
@@ -84,35 +100,34 @@ def start_exercise():
         workout_plan_id = session.get('workout_plan_id')
         
         # Create new workout session
-        session_repo = WorkoutSessionRepository()
+        session_repo = WorkoutSessionRepository(db)
         workout_session = session_repo.create_session(user_id, workout_plan_id)
         
         if workout_session:
             session['workout_session_id'] = workout_session.id
     
-    return jsonify({
+    return {
         'success': True,
-        'message': f'Started {exercise_name} exercise tracking',
-        'is_timed': is_timed
-    })
+        'message': f'Started {data.exercise} exercise tracking',
+        'is_timed': data.is_timed
+    }
 
-
-@exercise_bp.route('/stop', methods=['POST'])
-def stop_exercise():
+@exercise_router.post("/stop", response_model=ExerciseStopResponse)
+async def stop_exercise(
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Stop the current exercise tracking.
-    
-    Returns:
-        JSON response with exercise statistics.
     """
-    global video_processor
+    session = request.session
     
     # Check if there's an active exercise
     if 'current_exercise' not in session:
-        return jsonify({
-            'success': False,
-            'error': 'No active exercise to stop'
-        }), 400
+        raise HTTPException(
+            status_code=400, 
+            detail="No active exercise to stop"
+        )
     
     # Get current exercise data
     current_exercise = session.pop('current_exercise', {})
@@ -130,7 +145,7 @@ def stop_exercise():
     workout_session_id = session.get('workout_session_id')
     
     if user_id and workout_session_id:
-        session_repo = WorkoutSessionRepository()
+        session_repo = WorkoutSessionRepository(db)
         
         # Add exercise record
         exercise_record = session_repo.add_exercise_record(
@@ -159,25 +174,21 @@ def stop_exercise():
     # Reset video processor state
     video_processor.reset_session()
     
-    return jsonify({
+    return {
         'success': True,
         'exercise': exercise_name,
         'duration': duration,
         'rep_count': rep_count,
         'time_accumulated': time_accumulated,
         'statistics': statistics
-    })
+    }
 
-
-@exercise_bp.route('/data', methods=['GET'])
-def get_exercise_data():
+@exercise_router.get("/data", response_model=ExerciseDataResponse)
+async def get_exercise_data(request: Request):
     """
     Get current exercise data.
-    
-    Returns:
-        JSON response with current exercise tracking data.
     """
-    global video_processor
+    session = request.session
     
     # Get data from video processor
     exercise_data = video_processor.exercise_data
@@ -201,43 +212,41 @@ def get_exercise_data():
     exercise_data['target_reps'] = target_reps
     exercise_data['target_duration'] = target_duration
     
-    return jsonify(exercise_data)
+    return exercise_data
 
-
-@exercise_bp.route('/stats', methods=['GET'])
-def get_exercise_stats():
+@exercise_router.get("/stats", response_model=ExerciseStatsResponse)
+async def get_exercise_stats():
     """
     Get comprehensive exercise statistics for the current session.
-    
-    Returns:
-        JSON response with detailed exercise statistics.
     """
-    global video_processor
-    
     # Get statistics from video processor
     statistics = video_processor.get_session_statistics()
     
-    return jsonify(statistics)
+    return {
+        'success': True,
+        'statistics': statistics
+    }
 
-
-@exercise_bp.route('/history', methods=['GET'])
-def get_exercise_history():
+@exercise_router.get("/history", response_model=ExerciseHistoryResponse)
+async def get_exercise_history(
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Get exercise history for the current user.
-    
-    Returns:
-        JSON response with exercise history.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get exercise history from database
-    session_repo = WorkoutSessionRepository()
+    session_repo = WorkoutSessionRepository(db)
     workout_sessions = session_repo.get_user_sessions(user_id)
     
     # Process sessions into a suitable format for frontend
@@ -247,41 +256,40 @@ def get_exercise_history():
         if session_data:
             history.append(session_data)
     
-    return jsonify({
+    return {
         'success': True,
         'history': history
-    })
+    }
 
-
-@exercise_bp.route('/common_feedback', methods=['GET'])
-def get_common_feedback():
+@exercise_router.get("/common_feedback", response_model=CommonFeedbackResponse)
+async def get_common_feedback(
+    exercise: Optional[str] = None,
+    period: str = "month",
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
     """
     Get common feedback for a specific exercise or all exercises.
     
     Query parameters:
         exercise: Optional exercise name to filter feedback
         period: Optional period ('session', 'week', 'month')
-        
-    Returns:
-        JSON response with common feedback items.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
-    
-    # Get query parameters
-    exercise = request.args.get('exercise')
-    period = request.args.get('period', 'month')
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get common feedback from database
-    session_repo = WorkoutSessionRepository()
+    session_repo = WorkoutSessionRepository(db)
     feedback_items = session_repo.get_common_feedback(user_id, period, exercise)
     
-    return jsonify({
+    return {
         'success': True,
         'feedback': feedback_items
-    })
+    }

@@ -4,21 +4,21 @@ Workout plan API routes for workout tracking application.
 This module defines the REST API endpoints for managing workout plans,
 including generating, retrieving, and executing workout plans.
 """
-from flask import Blueprint, request, jsonify, session
-import google.generativeai as genai
-import json
 import time
-from typing import Dict, List, Any, Optional
 import logging
+from typing import Dict, List, Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
+import google.generativeai as genai
 
 from modules.workout_extractor import WorkoutExtractor
 from database.repository import WorkoutPlanRepository, UserRepository
-from database.models import db
-
+from database.db import get_db
 from config import GOOGLE_API_KEY
 
-# Create Blueprint for workout routes
-workout_bp = Blueprint('workout', __name__, url_prefix='/api/workout')
+# Create router
+workout_router = APIRouter()
 
 # Initialize Google Generative AI
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -27,50 +27,54 @@ model = genai.GenerativeModel('gemini-pro')
 # Initialize workout extractor
 workout_extractor = WorkoutExtractor(GOOGLE_API_KEY)
 
+# Pydantic models for request/response validation
+class UserProfile(BaseModel):
+    weight: float
+    height: float
+    gender: str
+    activity: str
+    goal: str
+    intensity: str
 
-@workout_bp.route('/generate', methods=['POST'])
-def generate_workout_plan():
+class GenerateWorkoutRequest(BaseModel):
+    user_profile: UserProfile
+    additional_requirements: Optional[str] = None
+
+class WorkoutPlanResponse(BaseModel):
+    success: bool
+    workout_plan: Optional[Any] = None
+    raw_plan: Optional[str] = None
+    error: Optional[str] = None
+
+class WorkoutPlansResponse(BaseModel):
+    success: bool
+    plans: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+
+class WorkoutPlanDetailResponse(BaseModel):
+    success: bool
+    plan: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+class StartWorkoutResponse(BaseModel):
+    success: bool
+    plan: Optional[Dict[str, Any]] = None
+    message: str
+    error: Optional[str] = None
+
+@workout_router.post("/generate", response_model=WorkoutPlanResponse)
+async def generate_workout_plan(
+    data: GenerateWorkoutRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Generate a workout plan based on user profile data.
-    
-    Request JSON:
-        {
-            "user_profile": {
-                "weight": 70,
-                "height": 175,
-                "gender": "male",
-                "activity": "moderate",
-                "goal": "strength",
-                "intensity": "medium"
-            },
-            "additional_requirements": "optional specific requirements"
-        }
-        
-    Returns:
-        JSON response with generated workout plan.
     """
-    data = request.json
-    
-    # Validate request data
-    if not data or 'user_profile' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Missing required user profile data'
-        }), 400
-    
-    # Extract user profile data
-    user_profile = data['user_profile']
-    required_fields = ['weight', 'height', 'gender', 'activity', 'goal', 'intensity']
-    
-    for field in required_fields:
-        if field not in user_profile:
-            return jsonify({
-                'success': False,
-                'error': f'Missing required field: {field}'
-            }), 400
+    session = request.session
     
     # Create prompt for AI
-    prompt = create_workout_prompt(user_profile, data.get('additional_requirements'))
+    prompt = create_workout_prompt(data.user_profile, data.additional_requirements)
     
     try:
         # Generate workout plan
@@ -87,41 +91,43 @@ def generate_workout_plan():
         
         # Save to database if user is logged in
         user_id = session.get('user_id')
+        saved_plan_id = None
         if user_id:
-            save_workout_plan_to_db(user_id, extracted_plan)
+            saved_plan_id = save_workout_plan_to_db(user_id, extracted_plan, db)
         
-        return jsonify({
-            'success': True,
-            'workout_plan': extracted_plan,
-            'raw_plan': raw_workout_plan
-        })
+        return WorkoutPlanResponse(
+            success=True,
+            workout_plan=extracted_plan,
+            raw_plan=raw_workout_plan
+        )
     
     except Exception as e:
         logging.error(f"Error generating workout plan: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'Failed to generate workout plan: {str(e)}'
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f'Failed to generate workout plan: {str(e)}'
+        )
 
-
-@workout_bp.route('/plans', methods=['GET'])
-def get_workout_plans():
+@workout_router.get("/plans", response_model=WorkoutPlansResponse)
+async def get_workout_plans(
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Get all workout plans for the current user.
-    
-    Returns:
-        JSON response with user's workout plans.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get workout plans from database
-    plan_repo = WorkoutPlanRepository()
+    plan_repo = WorkoutPlanRepository(db)
     plans = plan_repo.get_user_workout_plans(user_id)
     
     # Format plans for API response
@@ -141,153 +147,151 @@ def get_workout_plans():
         
         formatted_plans.append(formatted_plan)
     
-    return jsonify({
-        'success': True,
-        'plans': formatted_plans
-    })
+    return WorkoutPlansResponse(
+        success=True,
+        plans=formatted_plans
+    )
 
-
-@workout_bp.route('/plans/<int:plan_id>', methods=['GET'])
-def get_workout_plan(plan_id):
+@workout_router.get("/plans/{plan_id}", response_model=WorkoutPlanDetailResponse)
+async def get_workout_plan(
+    plan_id: int,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Get a specific workout plan by ID.
-    
-    Args:
-        plan_id: ID of the workout plan to retrieve.
-        
-    Returns:
-        JSON response with workout plan details.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get workout plan from database
-    plan_repo = WorkoutPlanRepository()
+    plan_repo = WorkoutPlanRepository(db)
     plan_details = plan_repo.get_plan_with_days_and_exercises(plan_id)
     
     if not plan_details:
-        return jsonify({
-            'success': False,
-            'error': f'Workout plan not found with ID: {plan_id}'
-        }), 404
+        raise HTTPException(
+            status_code=404,
+            detail=f'Workout plan not found with ID: {plan_id}'
+        )
     
     # Check if plan belongs to current user
     plan = plan_repo.get_workout_plan(plan_id)
     if plan.user_id != user_id:
-        return jsonify({
-            'success': False,
-            'error': 'You do not have permission to access this workout plan'
-        }), 403
+        raise HTTPException(
+            status_code=403,
+            detail='You do not have permission to access this workout plan'
+        )
     
-    return jsonify({
-        'success': True,
-        'plan': plan_details
-    })
+    return WorkoutPlanDetailResponse(
+        success=True,
+        plan=plan_details
+    )
 
-
-@workout_bp.route('/plans/<int:plan_id>', methods=['DELETE'])
-def delete_workout_plan(plan_id):
+@workout_router.delete("/plans/{plan_id}")
+async def delete_workout_plan(
+    plan_id: int,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Delete a specific workout plan by ID.
-    
-    Args:
-        plan_id: ID of the workout plan to delete.
-        
-    Returns:
-        JSON response indicating success or failure.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get workout plan from database
-    plan_repo = WorkoutPlanRepository()
+    plan_repo = WorkoutPlanRepository(db)
     plan = plan_repo.get_workout_plan(plan_id)
     
     if not plan:
-        return jsonify({
-            'success': False,
-            'error': f'Workout plan not found with ID: {plan_id}'
-        }), 404
+        raise HTTPException(
+            status_code=404,
+            detail=f'Workout plan not found with ID: {plan_id}'
+        )
     
     # Check if plan belongs to current user
     if plan.user_id != user_id:
-        return jsonify({
-            'success': False,
-            'error': 'You do not have permission to delete this workout plan'
-        }), 403
+        raise HTTPException(
+            status_code=403,
+            detail='You do not have permission to delete this workout plan'
+        )
     
     # Delete the plan
     success = plan_repo.delete_workout_plan(plan_id)
     
     if not success:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to delete workout plan'
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail='Failed to delete workout plan'
+        )
     
-    return jsonify({
+    return {
         'success': True,
         'message': f'Workout plan with ID {plan_id} deleted successfully'
-    })
+    }
 
-
-@workout_bp.route('/plans/<int:plan_id>/start', methods=['POST'])
-def start_workout_plan(plan_id):
+@workout_router.post("/plans/{plan_id}/start", response_model=StartWorkoutResponse)
+async def start_workout_plan(
+    plan_id: int,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Start a workout session for a specific workout plan.
-    
-    Args:
-        plan_id: ID of the workout plan to start.
-        
-    Returns:
-        JSON response with workout plan details for execution.
     """
+    session = request.session
+    
     # Check if user is logged in
     user_id = session.get('user_id')
     if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'User not logged in'
-        }), 401
+        raise HTTPException(
+            status_code=401,
+            detail="User not logged in"
+        )
     
     # Get workout plan from database
-    plan_repo = WorkoutPlanRepository()
+    plan_repo = WorkoutPlanRepository(db)
     plan_details = plan_repo.get_plan_with_days_and_exercises(plan_id)
     
     if not plan_details:
-        return jsonify({
-            'success': False,
-            'error': f'Workout plan not found with ID: {plan_id}'
-        }), 404
+        raise HTTPException(
+            status_code=404,
+            detail=f'Workout plan not found with ID: {plan_id}'
+        )
     
     # Store plan ID in session for tracking
     session['workout_plan_id'] = plan_id
     
-    return jsonify({
-        'success': True,
-        'plan': plan_details,
-        'message': f'Workout plan with ID {plan_id} started'
-    })
+    return StartWorkoutResponse(
+        success=True,
+        plan=plan_details,
+        message=f'Workout plan with ID {plan_id} started'
+    )
 
-
-@workout_bp.route('/current', methods=['GET'])
-def get_current_workout():
+@workout_router.get("/current", response_model=WorkoutPlanDetailResponse)
+async def get_current_workout(
+    request: Request,
+    db: Session = Depends(get_db)
+):
     """
     Get the workout plan currently in session.
-    
-    Returns:
-        JSON response with current workout plan.
     """
+    session = request.session
+    
     # Check if there's a plan in session
     workout_plan = session.get('workout_plan_structured')
     
@@ -296,27 +300,26 @@ def get_current_workout():
         plan_id = session.get('workout_plan_id')
         if plan_id:
             # Get plan from database
-            plan_repo = WorkoutPlanRepository()
+            plan_repo = WorkoutPlanRepository(db)
             workout_plan = plan_repo.get_plan_with_days_and_exercises(plan_id)
     
     if not workout_plan:
-        return jsonify({
-            'success': False,
-            'error': 'No active workout plan in session'
-        }), 404
+        raise HTTPException(
+            status_code=404,
+            detail='No active workout plan in session'
+        )
     
-    return jsonify({
-        'success': True,
-        'workout_plan': workout_plan
-    })
+    return WorkoutPlanDetailResponse(
+        success=True,
+        plan=workout_plan
+    )
 
-
-def create_workout_prompt(user_profile: Dict[str, Any], additional_requirements: Optional[str] = None) -> str:
+def create_workout_prompt(user_profile: UserProfile, additional_requirements: Optional[str] = None) -> str:
     """
     Create an AI prompt to generate a personalized workout plan.
     
     Args:
-        user_profile: Dictionary containing user profile data.
+        user_profile: User profile data.
         additional_requirements: Optional specific requirements for the workout plan.
         
     Returns:
@@ -324,12 +327,12 @@ def create_workout_prompt(user_profile: Dict[str, Any], additional_requirements:
     """
     prompt = f"""
     You are a specialized workout plan generator. Create a strict 7-day workout plan based on the following information:
-    - Weight: {user_profile.get('weight', 'Not provided')} kg
-    - Height: {user_profile.get('height', 'Not provided')} cm
-    - Gender: {user_profile.get('gender', 'Not provided')}
-    - Current activity level: {user_profile.get('activity', 'Not provided')}
-    - Fitness goal: {user_profile.get('goal', 'Not provided')}
-    - Desired Workout Intensity: {user_profile.get('intensity', 'Not provided')} (amount of time can spend per week to workout)
+    - Weight: {user_profile.weight} kg
+    - Height: {user_profile.height} cm
+    - Gender: {user_profile.gender}
+    - Current activity level: {user_profile.activity}
+    - Fitness goal: {user_profile.goal}
+    - Desired Workout Intensity: {user_profile.intensity} (amount of time can spend per week to workout)
 
     Adhere to these rules strictly:
     1. Provide exactly 7 days of workouts, labeled Day 1 through Day 7.
@@ -363,20 +366,20 @@ def create_workout_prompt(user_profile: Dict[str, Any], additional_requirements:
     
     return prompt
 
-
-def save_workout_plan_to_db(user_id: int, workout_plan: List[Dict[str, Any]]) -> Optional[int]:
+def save_workout_plan_to_db(user_id: int, workout_plan: List[Dict[str, Any]], db: Session) -> Optional[int]:
     """
     Save a generated workout plan to the database.
     
     Args:
         user_id: ID of the user who owns this plan.
         workout_plan: Structured workout plan data.
+        db: Database session.
         
     Returns:
         ID of the created workout plan or None if creation failed.
     """
     # Create workout plan
-    plan_repo = WorkoutPlanRepository()
+    plan_repo = WorkoutPlanRepository(db)
     
     # Generate title based on workout focus
     exercise_counts = {}
